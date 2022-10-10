@@ -3,15 +3,43 @@ use bitcoin::hashes::Hash;
 use bitcoin::{PubkeyHash, Script};
 
 use crate::miniscript::context;
+use crate::miniscript::satisfy::WitnessItem;
 use crate::prelude::*;
-use crate::{ScriptContext, ToPublicKey};
+use crate::{MiniscriptKey, ScriptContext, ToPublicKey};
 pub(crate) fn varint_len(n: usize) -> usize {
     bitcoin::VarInt(n as u64).len()
 }
 
+pub(crate) trait ItemSize {
+    fn size(&self) -> usize;
+}
+
+impl<Pk: MiniscriptKey> ItemSize for WitnessItem<Pk> {
+    fn size(&self) -> usize {
+        match self {
+            WitnessItem::Pubkey(_, size) => *size,
+            WitnessItem::EcdsaSigPk(_) | WitnessItem::EcdsaSigHash(_) => 72,
+            WitnessItem::SchnorrSig(_, _) => 65,
+            WitnessItem::HashDissatisfaction
+            | WitnessItem::Sha256Preimage(_)
+            | WitnessItem::Hash256Preimage(_)
+            | WitnessItem::Ripemd160Preimage(_)
+            | WitnessItem::Hash160Preimage(_) => 32,
+            WitnessItem::PushOne => 1,
+            WitnessItem::PushZero => 0,
+        }
+    }
+}
+
+impl ItemSize for Vec<u8> {
+    fn size(&self) -> usize {
+        self.len()
+    }
+}
+
 // Helper function to calculate witness size
-pub(crate) fn witness_size(wit: &[Vec<u8>]) -> usize {
-    wit.iter().map(Vec::len).sum::<usize>() + varint_len(wit.len())
+pub(crate) fn witness_size<T: ItemSize>(wit: &[T]) -> usize {
+    wit.iter().map(T::size).sum::<usize>() + varint_len(wit.len())
 }
 
 pub(crate) fn witness_to_scriptsig(witness: &[Vec<u8>]) -> Script {

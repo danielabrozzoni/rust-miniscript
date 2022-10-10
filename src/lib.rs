@@ -88,7 +88,7 @@
 #![deny(unused_mut)]
 #![deny(dead_code)]
 #![deny(unused_imports)]
-#![deny(missing_docs)]
+//#![deny(missing_docs)]
 
 #[cfg(target_pointer_width = "16")]
 compile_error!(
