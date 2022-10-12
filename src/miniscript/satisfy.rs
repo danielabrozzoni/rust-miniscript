@@ -214,11 +214,13 @@ where
     }
 
     fn lookup_raw_pkh_pk<Ctx: ScriptContext>(&self, hash: &hash160::Hash) -> Option<usize> {
-        Satisfier::lookup_raw_pkh_pk(self, hash).map(|p| Ctx::pk_len(&p))
+        // Ctx::pk_len includes a one-byte OP_PUSH, which we don't need here
+        Satisfier::lookup_raw_pkh_pk(self, hash).map(|p| Ctx::pk_len(&p) - 1)
     }
 
     fn lookup_raw_pkh_ecdsa_sig<Ctx: ScriptContext>(&self, hash: &hash160::Hash) -> Option<usize> {
-        Satisfier::lookup_raw_pkh_ecdsa_sig(self, hash).map(|(p, _)| Ctx::pk_len(&p))
+        // Ctx::pk_len includes a one-byte OP_PUSH, which we don't need here
+        Satisfier::lookup_raw_pkh_ecdsa_sig(self, hash).map(|(p, _)| Ctx::pk_len(&p) - 1)
     }
 
     fn lookup_raw_pkh_tap_leaf_script_sig(&self, hash: &(hash160::Hash, TapLeafHash)) -> bool {
@@ -651,11 +653,17 @@ pub enum WitnessItem<Pk: MiniscriptKey> {
 impl<Pk: MiniscriptKey + ToPublicKey> WitnessItem<Pk> {
     fn satisfy_self<Sat: Satisfier<Pk>>(&self, sat: &Sat) -> Option<Vec<u8>> {
         match self {
-            WitnessItem::Pubkey(pkh, size) => sat.lookup_raw_pkh_pk(pkh).map(|pk| {
-                let pk = pk.to_public_key().to_bytes();
-                debug_assert!(pk.len() == *size);
-                pk
-            }),
+            // TODO: creiamo pubkey sia da lookup_raw_pkh_pk and lookup_raw_pkh_ecdsa_sig, quindi
+            // mo devo guardare in entrambe
+            WitnessItem::Pubkey(pkh, size) => sat
+                .lookup_raw_pkh_pk(pkh)
+                .map(|p| p.to_public_key())
+                .or(sat.lookup_raw_pkh_ecdsa_sig(pkh).map(|(p, _)| p))
+                .map(|pk| {
+                    let pk = pk.to_bytes();
+                    debug_assert!(pk.len() == *size);
+                    pk
+                }),
             WitnessItem::Hash256Preimage(h) => sat.lookup_hash256(h).map(|p| p.to_vec()),
             WitnessItem::Sha256Preimage(h) => sat.lookup_sha256(h).map(|p| p.to_vec()),
             WitnessItem::Hash160Preimage(h) => sat.lookup_hash160(h).map(|p| p.to_vec()),
