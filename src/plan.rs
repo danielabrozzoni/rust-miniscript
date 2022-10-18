@@ -23,17 +23,20 @@
 //! Once you've obstained signatures, hash pre-images etc required by the plan, it can create a
 //! witness/script_sig for the input.
 
-use crate::descriptor::DescriptorType;
-use crate::miniscript::satisfy::{Placeholder, Satisfier, WitnessTemplate};
-use crate::miniscript::{context::SigType, hash256};
-use crate::util::witness_size;
-use crate::{DefiniteDescriptorKey, MiniscriptKey, ScriptContext, ToPublicKey};
+use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
+
 use bitcoin::hashes::{hash160, ripemd160, sha256};
 use bitcoin::util::address::WitnessVersion;
 use bitcoin::util::taproot::TapLeafHash;
 use bitcoin::{LockTime, Sequence};
-use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+
+use crate::descriptor::DescriptorType;
+use crate::miniscript::context::SigType;
+use crate::miniscript::hash256;
+use crate::miniscript::satisfy::{Placeholder, Satisfier, WitnessTemplate};
+use crate::util::witness_size;
+use crate::{DefiniteDescriptorKey, MiniscriptKey, ScriptContext, ToPublicKey};
 
 /// Trait describing a present/missing lookup table for constructing witness templates
 ///
@@ -196,11 +199,10 @@ where
     }
 }
 
-/// A spending plan or *plan* for short is a representation of a particular spending path on a
-/// descriptor. This allows us to analayze a choice of spending path without producing any
-/// signatures or other witness data for it.
-/// Calling `get_plan` on a Descriptor will return this structure, which contains a Witness
-/// Template for the cheapest possible (i.e., considering the `Assets` given) spending path
+/// Representation of a particular spending path on a descriptor. Contains the witness template
+/// and the timelocks needed for satisfying the plan.
+/// Calling `get_plan` on a Descriptor will return this structure,
+/// containing the cheapest spending path possible (considering the `Assets` given)
 #[derive(Debug, Clone)]
 pub struct Plan {
     /// This plan's witness template
@@ -214,17 +216,18 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Returns the witness version
     pub fn witness_version(&self) -> Option<WitnessVersion> {
         self.desc_type.segwit_version()
     }
 
     /// The weight, in witness units, needed for satisfying this plan (includes both
-    /// the script sig size and the witness size)
+    /// the script sig weight and the witness weight)
     pub fn satisfaction_weight(&self) -> usize {
         self.witness_size() + self.scriptsig_size() * 4
     }
 
-    /// The weight, in witness units, of the script sig that satisfies this plan
+    /// The size in bytes of the script sig that satisfies this plan
     pub fn scriptsig_size(&self) -> usize {
         match (self.desc_type.segwit_version(), self.desc_type) {
             // Entire witness goes in the script_sig
@@ -240,7 +243,7 @@ impl Plan {
         }
     }
 
-    /// The weight, in witness units, of the witness that satisfies this plan
+    /// The size in bytes of the witness that satisfies this plan
     pub fn witness_size(&self) -> usize {
         if let Some(_) = self.desc_type.segwit_version() {
             witness_size(self.template.as_ref())
@@ -456,11 +459,13 @@ impl Assets {
 
 #[cfg(test)]
 mod test {
+    use std::str::FromStr;
+
+    use bitcoin::{LockTime, Sequence};
+
     use super::*;
     use crate::miniscript::satisfy::Witness;
     use crate::*;
-    use bitcoin::{LockTime, Sequence};
-    use std::str::FromStr;
 
     #[test]
     fn test_plan() {

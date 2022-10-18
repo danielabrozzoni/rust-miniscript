@@ -55,8 +55,9 @@ pub use crate::miniscript::context::ScriptContext;
 use crate::miniscript::decode::Terminal;
 use crate::miniscript::types::extra_props::ExtData;
 use crate::miniscript::types::Type;
-use crate::plan;
-use crate::{expression, Error, ForEachKey, MiniscriptKey, ToPublicKey, TranslatePk, Translator};
+use crate::{
+    expression, plan, Error, ForEachKey, MiniscriptKey, ToPublicKey, TranslatePk, Translator,
+};
 #[cfg(test)]
 mod ms_tests;
 

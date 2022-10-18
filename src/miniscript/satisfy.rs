@@ -19,6 +19,7 @@
 //!
 
 use core::{cmp, i64, mem};
+use std::fmt;
 
 use bitcoin::hashes::hash160;
 use bitcoin::secp256k1::XOnlyPublicKey;
@@ -538,13 +539,28 @@ pub enum Placeholder<Pk: MiniscriptKey> {
     TapControlBlock(ControlBlock),
 }
 
-// impl<Pk: MiniscriptKey> fmt::Display for Placeholder<Pk> {
-//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-//         match self {
-//             Placeholder::Pubkey(pkh, size) => write!(f, "Pubkey({}, {})", self.x, self.y)
-//         }
-//     }
-// }
+impl<Pk: MiniscriptKey> fmt::Display for Placeholder<Pk> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use Placeholder::*;
+        use bitcoin::hashes::hex::ToHex;
+        match self {
+            Pubkey(pk, size) => write!(f, "Pubkey(pk: {}, size: {})", pk, size),
+            PubkeyHash(pkh, size) => write!(f, "PubkeyHash(pkh: {}, size: {})", pkh, size),
+            EcdsaSigPk(pk) => write!(f, "EcdsaSigPk(pk: {})", pk),
+            EcdsaSigHash(hash) => write!(f, "EcdsaSigHash(hash: {})", hash),
+            SchnorrSig(pk, tap_leaf_hash) => write!(f, "SchnorrSig(pk: {}, tap_leaf_hash: {:?})", pk, tap_leaf_hash),
+            Sha256Preimage(hash) => write!(f, "Sha256Preimage(hash: {})", hash),
+            Hash256Preimage(hash) => write!(f, "Hash256Preimage(hash: {})", hash),
+            Ripemd160Preimage(hash) => write!(f, "Ripemd160Preimage(hash: {})", hash),
+            Hash160Preimage(hash) => write!(f, "Hash160Preimage(hash: {})", hash),
+            HashDissatisfaction => write!(f, "HashDissatisfaction"),
+            PushOne => write!(f, "PushOne"),
+            PushZero => write!(f, "PushZero"),
+            TapScript(script) => write!(f, "TapScript(script: {})", script),
+            TapControlBlock(control_block) => write!(f, "TapControlBlock(control_block: {})", control_block.serialize().to_hex()),
+        }
+    }
+}
 
 impl<Pk: MiniscriptKey + ToPublicKey> Placeholder<Pk> {
     /// Replaces the placeholders with the information given by the satisfier

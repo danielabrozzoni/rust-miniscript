@@ -812,8 +812,8 @@ impl Descriptor<DefiniteDescriptorKey> {
         self.for_each_key(|pk| {
             let found = match &pk.0 {
                 s @ DescriptorPublicKey::Single(_) => key_map.contains_key(&s),
-                x @ DescriptorPublicKey::XPub(xkey) => {
-                    if key_map.contains_key(&x) {
+                DescriptorPublicKey::XPub(xkey) => {
+                    if key_map.contains_key(&DescriptorPublicKey::XPub(xkey.clone())) {
                         true
                     } else if xkey.derivation_path.len() > 0 {
                         let unwind_wildcard = DescriptorXKey {
@@ -823,7 +823,7 @@ impl Descriptor<DefiniteDescriptorKey> {
                             derivation_path: xkey
                                 .derivation_path
                                 .into_iter()
-                                .take(xkey.derivation_path.len() - 2)
+                                .take(xkey.derivation_path.len() - 1)
                                 .cloned()
                                 .collect::<Vec<_>>()
                                 .into(),
