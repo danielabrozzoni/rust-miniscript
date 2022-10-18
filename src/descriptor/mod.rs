@@ -35,7 +35,7 @@ use sync::Arc;
 
 use self::checksum::verify_checksum;
 use crate::miniscript::{Legacy, Miniscript, Segwitv0};
-use crate::plan::{AssetProvider, Plan};
+use crate::plan::{AssetProvider, Assets, IntoAssets, Plan};
 use crate::prelude::*;
 use crate::{
     expression, hash256, miniscript, BareCtx, Error, ForEachKey, MiniscriptKey, Satisfier,
@@ -803,6 +803,46 @@ impl Descriptor<DefiniteDescriptorKey> {
 
         let derived = self.translate_pk(&mut Derivator(secp))?;
         Ok(derived)
+    }
+
+    /// Returns the set of keys which are available in the [`KeyMap`] in form of [`Assets`]
+    pub fn available_keys(&self, key_map: &KeyMap) -> Assets {
+        let mut available_keys = vec![];
+
+        self.for_each_key(|pk| {
+            let found = match &pk.0 {
+                s @ DescriptorPublicKey::Single(_) => key_map.contains_key(&s),
+                x @ DescriptorPublicKey::XPub(xkey) => {
+                    if key_map.contains_key(&x) {
+                        true
+                    } else if xkey.derivation_path.len() > 0 {
+                        let unwind_wildcard = DescriptorXKey {
+                            origin: xkey.origin.clone(),
+                            xkey: xkey.xkey,
+                            wildcard: Wildcard::Unhardened,
+                            derivation_path: xkey
+                                .derivation_path
+                                .into_iter()
+                                .take(xkey.derivation_path.len() - 2)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .into(),
+                        };
+                        key_map.contains_key(&DescriptorPublicKey::XPub(unwind_wildcard))
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            if found {
+                available_keys.push(pk.clone());
+            }
+
+            true
+        });
+
+        available_keys.into_assets()
     }
 }
 

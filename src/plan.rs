@@ -201,7 +201,7 @@ where
 /// signatures or other witness data for it.
 /// Calling `get_plan` on a Descriptor will return this structure, which contains a Witness
 /// Template for the cheapest possible (i.e., considering the `Assets` given) spending path
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Plan {
     /// This plan's witness template
     pub template: WitnessTemplate<Placeholder<DefiniteDescriptorKey>>,
@@ -214,6 +214,10 @@ pub struct Plan {
 }
 
 impl Plan {
+    pub fn witness_version(&self) -> Option<WitnessVersion> {
+        self.desc_type.segwit_version()
+    }
+
     /// The weight, in witness units, needed for satisfying this plan (includes both
     /// the script sig size and the witness size)
     pub fn satisfaction_weight(&self) -> usize {
@@ -347,9 +351,23 @@ pub trait IntoAssets {
 
 impl IntoAssets for DefiniteDescriptorKey {
     fn into_assets(self) -> Assets {
-        let pkh = self.to_pubkeyhash(SigType::Ecdsa);
+        vec![self].into_assets()
+    }
+}
+
+impl IntoAssets for Vec<DefiniteDescriptorKey> {
+    fn into_assets(self) -> Assets {
         Assets {
-            keys: vec![(pkh, self)].into_iter().collect(),
+            keys: self
+                .into_iter()
+                .map(|pk| {
+                    vec![
+                        (pk.to_pubkeyhash(SigType::Ecdsa), pk.clone()),
+                        (pk.to_pubkeyhash(SigType::Schnorr), pk),
+                    ]
+                })
+                .flatten()
+                .collect(),
             ..Default::default()
         }
     }
