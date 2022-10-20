@@ -339,7 +339,8 @@ impl AssetProvider<DefiniteDescriptorKey> for Assets {
 
     fn check_after(&self, l: LockTime) -> bool {
         if let Some(at) = &self.absolute_timelock {
-            return l.partial_cmp(at) == Some(Ordering::Less);
+            let cmp = l.partial_cmp(at);
+            return cmp == Some(Ordering::Less) || cmp == Some(Ordering::Equal);
         }
 
         false
