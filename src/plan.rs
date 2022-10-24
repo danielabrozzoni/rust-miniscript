@@ -465,33 +465,15 @@ mod test {
     use bitcoin::{LockTime, Sequence};
 
     use super::*;
-    use crate::miniscript::satisfy::Witness;
     use crate::*;
-
-    #[test]
-    fn test_plan() {
-        let key = "xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDfVxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz";
-        let desc = format!("wsh(and_v(or_c(pk(023fc33527afab09fa97135f2180bcd22ce637b1d2fbcb2db748b1f2c33f45b2b4),v:older(12960)),pk({}/1/2/*)))", key);
-        let desc = Descriptor::<DescriptorPublicKey>::from_str(&desc).unwrap();
-
-        let def_key = DefiniteDescriptorKey::from_str(&format!("{}/1/2/3", key)).unwrap();
-
-        let assets = Assets::new()
-            .add(def_key)
-            .older(Sequence::from_height(12960));
-
-        let result = desc.at_derivation_index(3).get_plan(&assets);
-        assert!(result.is_some());
-        assert_eq!(
-            result.unwrap().relative_timelock,
-            Some(bitcoin::Sequence(12960))
-        );
-    }
 
     fn test_inner(
         desc: &str,
         keys: Vec<DefiniteDescriptorKey>,
+        hashes: Vec<hash160::Hash>,
+        // [ (key_indexes, hash_indexes, older, after, expected) ]
         tests: Vec<(
+            Vec<usize>,
             Vec<usize>,
             Option<Sequence>,
             Option<LockTime>,
@@ -500,7 +482,7 @@ mod test {
     ) {
         let desc = Descriptor::<DefiniteDescriptorKey>::from_str(&desc).unwrap();
 
-        for (key_indexes, older, after, expected) in tests {
+        for (key_indexes, hash_indexes, older, after, expected) in tests {
             let mut assets = Assets::new();
             if let Some(seq) = older {
                 assets = assets.older(seq);
@@ -511,12 +493,15 @@ mod test {
             for ki in key_indexes {
                 assets = assets.add(keys[ki].clone());
             }
+            for hi in hash_indexes {
+                assets = assets.add(hashes[hi].clone());
+            }
 
             let result = desc.get_plan(&assets);
             assert_eq!(
                 result.as_ref().map(|plan| plan.satisfaction_weight()),
                 expected,
-                "{:?}",
+                "{:#?}",
                 result
             );
         }
@@ -534,16 +519,17 @@ mod test {
             )
             .unwrap(),
         ];
+        let hashes = vec![];
+        let desc = format!("wsh(t:or_c(pk({}),v:pkh({})))", keys[0], keys[1]);
 
         // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig)
         let tests = vec![
-            (vec![], None, None, None),
-            (vec![0], None, None, Some(4 + 1 + 73)),
-            (vec![0, 1], None, None, Some(4 + 1 + 73)),
+            (vec![], vec![], None, None, None),
+            (vec![0], vec![], None, None, Some(4 + 1 + 73)),
+            (vec![0, 1], vec![], None, None, Some(4 + 1 + 73)),
         ];
 
-        let desc = format!("wsh(t:or_c(pk({}),v:pkh({})))", keys[0], keys[1]);
-        test_inner(&desc, keys, tests);
+        test_inner(&desc, keys, hashes, tests);
     }
 
     #[test]
@@ -558,16 +544,17 @@ mod test {
             )
             .unwrap(),
         ];
+        let hashes = vec![];
+        let desc = format!("wsh(and_v(v:pk({}),pk({})))", keys[0], keys[1]);
 
         // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) * 2
         let tests = vec![
-            (vec![], None, None, None),
-            (vec![0], None, None, None),
-            (vec![0, 1], None, None, Some(4 + 1 + 73 * 2)),
+            (vec![], vec![], None, None, None),
+            (vec![0], vec![], None, None, None),
+            (vec![0, 1], vec![], None, None, Some(4 + 1 + 73 * 2)),
         ];
 
-        let desc = format!("wsh(and_v(v:pk({}),pk({})))", keys[0], keys[1]);
-        test_inner(&desc, keys, tests);
+        test_inner(&desc, keys, hashes, tests);
     }
 
     #[test]
@@ -590,19 +577,20 @@ mod test {
             )
             .unwrap(),
         ];
-
-        let tests = vec![
-            (vec![], None, None, None),
-            (vec![0, 1], None, None, None),
-            // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) * 3 + 1 (dummy push)
-            (vec![0, 1, 3], None, None, Some(4 + 1 + 73 * 3 + 1)),
-        ];
-
+        let hashes = vec![];
         let desc = format!(
             "wsh(multi(3,{},{},{},{}))",
             keys[0], keys[1], keys[2], keys[3]
         );
-        test_inner(&desc, keys, tests);
+
+        let tests = vec![
+            (vec![], vec![], None, None, None),
+            (vec![0, 1], vec![], None, None, None),
+            // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) * 3 + 1 (dummy push)
+            (vec![0, 1, 3], vec![], None, None, Some(4 + 1 + 73 * 3 + 1)),
+        ];
+
+        test_inner(&desc, keys, hashes, tests);
     }
 
     #[test]
@@ -617,36 +605,44 @@ mod test {
             )
             .unwrap(),
         ];
+        let hashes = vec![];
+        let desc = format!(
+            "wsh(thresh(2,pk({}),s:pk({}),snl:older(144)))",
+            keys[0], keys[1]
+        );
 
         let tests = vec![
-            (vec![], None, None, None),
-            (vec![], Some(Sequence(1000)), None, None),
-            (vec![0], None, None, None),
+            (vec![], vec![], None, None, None),
+            (vec![], vec![], Some(Sequence(1000)), None, None),
+            (vec![0], vec![], None, None, None),
             // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) + 1 (OP_0) + 1 (OP_ZERO)
-            (vec![0], Some(Sequence(1000)), None, Some(80)),
+            (vec![0], vec![], Some(Sequence(1000)), None, Some(80)),
             // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) * 2 + 2 (OP_PUSHBYTE_1 0x01)
-            (vec![0, 1], None, None, Some(153)),
+            (vec![0, 1], vec![], None, None, Some(153)),
             // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) + 1 (OP_0) + 1 (OP_ZERO)
-            (vec![0, 1], Some(Sequence(1000)), None, Some(80)),
+            (vec![0, 1], vec![], Some(Sequence(1000)), None, Some(80)),
             // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) * 2 + 2 (OP_PUSHBYTE_1 0x01)
             (
                 vec![0, 1],
+                vec![],
                 Some(Sequence::from_512_second_intervals(10)),
                 None,
                 Some(153),
             ), // incompatible timelock
         ];
 
+        test_inner(&desc, keys.clone(), hashes.clone(), tests);
+
         let desc = format!(
-            "wsh(thresh(2,pk({}),s:pk({}),snl:older(144)))",
+            "wsh(thresh(2,pk({}),s:pk({}),snl:after(144)))",
             keys[0], keys[1]
         );
-        test_inner(&desc, keys.clone(), tests);
 
         let tests = vec![
             // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) + 1 (OP_0) + 1 (OP_ZERO)
             (
                 vec![0],
+                vec![],
                 None,
                 Some(LockTime::from_height(1000).unwrap()),
                 Some(80),
@@ -654,16 +650,135 @@ mod test {
             // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) * 2 + 2 (OP_PUSHBYTE_1 0x01)
             (
                 vec![0, 1],
+                vec![],
                 None,
                 Some(LockTime::from_time(500_001_000).unwrap()),
                 Some(153),
             ), // incompatible timelock
         ];
 
+        test_inner(&desc, keys, hashes, tests);
+    }
+
+    #[test]
+    fn test_taproot() {
+        let keys = vec![
+            DefiniteDescriptorKey::from_str(
+                "02c2fd50ceae468857bb7eb32ae9cd4083e6c7e42fbbec179d81134b3e3830586c",
+            )
+            .unwrap(),
+            DefiniteDescriptorKey::from_str(
+                "0257f4a2816338436cccabc43aa724cf6e69e43e84c3c8a305212761389dd73a8a",
+            )
+            .unwrap(),
+            DefiniteDescriptorKey::from_str(
+                "03500a2b48b0f66c8183cc0d6645ab21cc19c7fad8a33ff04d41c3ece54b0bc1c5",
+            )
+            .unwrap(),
+            DefiniteDescriptorKey::from_str(
+                "033ad2d191da4f39512adbaac320cae1f12f298386a4e9d43fd98dec7cf5db2ac9",
+            )
+            .unwrap(),
+            DefiniteDescriptorKey::from_str(
+                "023fc33527afab09fa97135f2180bcd22ce637b1d2fbcb2db748b1f2c33f45b2b4",
+            )
+            .unwrap(),
+        ];
+        let hashes = vec![];
+        //    .
+        //   / \
+        //  .   .
+        //  A  / \
+        //    .   .
+        //    B   C
         let desc = format!(
-            "wsh(thresh(2,pk({}),s:pk({}),snl:after(144)))",
-            keys[0], keys[1]
+            "tr({},{{pk({}),{{multi_a(1,{},{}),and_v(v:pk({}),after(10))}}}})",
+            keys[0], keys[1], keys[2], keys[3], keys[4]
         );
-        test_inner(&desc, keys, tests);
+
+        // expected weight: 4 (scriptSig len) + 1 (witness len) + 1 (OP_PUSH) + 65 (sig)
+        let internal_key_sat_weight = Some(71);
+        // expected weight: 4 (scriptSig len) + 1 (witness len) + 1 (OP_PUSH) + 65 (sig)
+        // + 34 [script: 1 (OP_PUSHBYTES_32) + 32 (key) + 1 (OP_CHECKSIG)]
+        // + 65 [control block: 1 (control byte) + 32 (internal key) + 32 (hash BC)]
+        let first_leaf_sat_weight = Some(170);
+        // expected weight: 4 (scriptSig len) + 1 (witness len) + 1 (OP_PUSH) + 65 (sig)
+        // + 1 (OP_ZERO)
+        // + 70 [script: 1 (OP_PUSHBYTES_32) + 32 (key) + 1 (OP_CHECKSIG)
+        //       + 1 (OP_PUSHBYTES_32) + 32 (key) + 1 (OP_CHECKSIGADD)
+        //       + 1 (OP_PUSHNUM1) + 1 (OP_NUMEQUAL)]
+        // + 97 [control block: 1 (control byte) + 32 (internal key) + 32 (hash C) + 32 (hash
+        //       A)]
+        let second_leaf_sat_weight = Some(239);
+        // expected weight: 4 (scriptSig len) + 1 (witness len) + 1 (OP_PUSH) + 65 (sig)
+        // + 36 [script: 1 (OP_PUSHBYTES_32) + 32 (key) + 1 (OP_CHECKSIGVERIFY)
+        //       + 1 (OP_PUSHNUM_10) + 1 (OP_CLTV)]
+        // + 97 [control block: 1 (control byte) + 32 (internal key) + 32 (hash B) + 32 (hash
+        //       A)]
+        let third_leaf_sat_weight = Some(204);
+
+        let tests = vec![
+            // Don't give assets
+            (vec![], vec![], None, None, None),
+            // Spend with internal key
+            (vec![0], vec![], None, None, internal_key_sat_weight),
+            // Spend with first leaf (single pk)
+            (vec![1], vec![], None, None, first_leaf_sat_weight),
+            // Spend with second leaf (1of2)
+            (vec![2], vec![], None, None, second_leaf_sat_weight),
+            // Spend with second leaf (1of2)
+            (vec![2, 3], vec![], None, None, second_leaf_sat_weight),
+            // Spend with third leaf (key + timelock)
+            (vec![4], vec![], None, Some(LockTime::from_consensus(10)), third_leaf_sat_weight),
+            // Spend with third leaf (key + timelock),
+            // but timelock is too low (=impossible)
+            (vec![4], vec![], None, Some(LockTime::from_consensus(9)), None),
+            // Spend with third leaf (key + timelock),
+            // but don't give the timelock (=impossible)
+            (vec![4], vec![], None, None, None),
+            // Give all the keys (internal key will be used, as it's cheaper)
+            (vec![0, 1, 2, 3, 4], vec![], None, None, internal_key_sat_weight),
+            // Give all the leaf keys (uses 1st leaf)
+            (vec![1, 2, 3, 4], vec![], None, None, first_leaf_sat_weight),
+            // Give 2nd+3rd leaf without timelock (uses 2nd leaf)
+            (vec![2, 3, 4], vec![], None, None, second_leaf_sat_weight),
+            // Give 2nd+3rd leaf with timelock (uses 3rd leaf)
+            (
+                vec![2, 3, 4],
+                vec![],
+                None,
+                Some(LockTime::from_consensus(11)),
+                third_leaf_sat_weight,
+            ),
+        ];
+
+        test_inner(&desc, keys, hashes, tests);
+    }
+
+    #[test]
+    fn test_hash() {
+        let keys = vec![
+            DefiniteDescriptorKey::from_str(
+                "02c2fd50ceae468857bb7eb32ae9cd4083e6c7e42fbbec179d81134b3e3830586c",
+            )
+            .unwrap(),
+        ];
+        let hashes = vec![hash160::Hash::from_slice(&vec![0; 20]).unwrap()];
+        let desc = format!("wsh(and_v(v:pk({}),hash160({})))", keys[0], hashes[0]);
+
+
+        let tests = vec![
+            // No assets, impossible
+            (vec![], vec![], None, None, None),
+            // Only key, impossible
+            (vec![0], vec![], None, None, None),
+            // Only hash, impossible
+            (vec![], vec![0], None, None, None),
+            // Key + hash
+            // expected weight: 4 (scriptSig len) + 1 (witness len) + 73 (sig) + 1 (OP_PUSH) + 32 (preimage)
+            (vec![0], vec![0], None, None, Some(111)),
+        ];
+
+        test_inner(&desc, keys, hashes, tests);
     }
 }
