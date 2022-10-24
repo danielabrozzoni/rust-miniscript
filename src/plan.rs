@@ -691,6 +691,9 @@ mod test {
         //  A  / \
         //    .   .
         //    B   C
+        //  where A = pk(key1)
+        //        B = multi(1, key2, key3)
+        //        C = and(key4, after(10))
         let desc = format!(
             "tr({},{{pk({}),{{multi_a(1,{},{}),and_v(v:pk({}),after(10))}}}})",
             keys[0], keys[1], keys[2], keys[3], keys[4]
@@ -729,15 +732,42 @@ mod test {
             // Spend with second leaf (1of2)
             (vec![2, 3], vec![], None, None, second_leaf_sat_weight),
             // Spend with third leaf (key + timelock)
-            (vec![4], vec![], None, Some(LockTime::from_consensus(10)), third_leaf_sat_weight),
+            (
+                vec![4],
+                vec![],
+                None,
+                Some(LockTime::from_height(10).unwrap()),
+                third_leaf_sat_weight,
+            ),
             // Spend with third leaf (key + timelock),
             // but timelock is too low (=impossible)
-            (vec![4], vec![], None, Some(LockTime::from_consensus(9)), None),
+            (
+                vec![4],
+                vec![],
+                None,
+                Some(LockTime::from_height(9).unwrap()),
+                None,
+            ),
+            // Spend with third leaf (key + timelock),
+            // but timelock is in the wrong unit (=impossible)
+            (
+                vec![4],
+                vec![],
+                None,
+                Some(LockTime::from_time(1296000000).unwrap()),
+                None,
+            ),
             // Spend with third leaf (key + timelock),
             // but don't give the timelock (=impossible)
             (vec![4], vec![], None, None, None),
             // Give all the keys (internal key will be used, as it's cheaper)
-            (vec![0, 1, 2, 3, 4], vec![], None, None, internal_key_sat_weight),
+            (
+                vec![0, 1, 2, 3, 4],
+                vec![],
+                None,
+                None,
+                internal_key_sat_weight,
+            ),
             // Give all the leaf keys (uses 1st leaf)
             (vec![1, 2, 3, 4], vec![], None, None, first_leaf_sat_weight),
             // Give 2nd+3rd leaf without timelock (uses 2nd leaf)
@@ -757,15 +787,12 @@ mod test {
 
     #[test]
     fn test_hash() {
-        let keys = vec![
-            DefiniteDescriptorKey::from_str(
-                "02c2fd50ceae468857bb7eb32ae9cd4083e6c7e42fbbec179d81134b3e3830586c",
-            )
-            .unwrap(),
-        ];
+        let keys = vec![DefiniteDescriptorKey::from_str(
+            "02c2fd50ceae468857bb7eb32ae9cd4083e6c7e42fbbec179d81134b3e3830586c",
+        )
+        .unwrap()];
         let hashes = vec![hash160::Hash::from_slice(&vec![0; 20]).unwrap()];
         let desc = format!("wsh(and_v(v:pk({}),hash160({})))", keys[0], hashes[0]);
-
 
         let tests = vec![
             // No assets, impossible
