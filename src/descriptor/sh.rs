@@ -25,8 +25,10 @@ use bitcoin::{Address, Network, Script};
 
 use super::checksum::{self, verify_checksum};
 use super::{SortedMultiVec, Wpkh, Wsh};
+use crate::descriptor::{DefiniteDescriptorKey, DescriptorType};
 use crate::expression::{self, FromTree};
 use crate::miniscript::context::ScriptContext;
+use crate::plan::{AssetProvider, Plan};
 use crate::policy::{semantic, Liftable};
 use crate::prelude::*;
 use crate::util::{varint_len, witness_to_scriptsig};
@@ -373,6 +375,44 @@ impl<Pk: MiniscriptKey + ToPublicKey> Sh<Pk> {
                 Ok((witness, script_sig))
             }
             _ => self.get_satisfaction(satisfier),
+        }
+    }
+}
+
+impl Sh<DefiniteDescriptorKey> {
+    /// Returns a plan if the provided assets are sufficient to produce a non-malleable satisfaction
+    pub fn get_plan<P>(&self, provider: &P) -> Option<Plan>
+    where
+        P: AssetProvider<DefiniteDescriptorKey>,
+    {
+        match &self.inner {
+            ShInner::Wsh(ref wsh) => wsh.get_plan(provider).map(|mut plan| {
+                plan.desc_type = DescriptorType::ShWsh;
+                plan
+            }),
+            ShInner::Wpkh(ref wpkh) => wpkh.get_plan(provider).map(|mut plan| {
+                plan.desc_type = DescriptorType::ShWpkh;
+                plan
+            }),
+            ShInner::SortedMulti(ref _smv) => todo!(),
+            ShInner::Ms(ref ms) => ms.build_template(provider).into_plan(DescriptorType::Sh),
+        }
+    }
+
+    /// Returns a plan if the provided assets are sufficient to produce a malleable satisfaction
+    pub fn get_plan_mall<P>(&self, provider: &P) -> Option<Plan>
+    where
+        P: AssetProvider<DefiniteDescriptorKey>,
+    {
+        match &self.inner {
+            ShInner::Wsh(ref wsh) => wsh.get_plan_mall(provider).map(|mut plan| {
+                plan.desc_type = DescriptorType::ShWsh;
+                plan
+            }),
+            ShInner::Ms(ref ms) => ms
+                .build_template_mall(provider)
+                .into_plan(DescriptorType::Sh),
+            _ => self.get_plan(provider),
         }
     }
 }
