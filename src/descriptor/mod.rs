@@ -35,6 +35,7 @@ use sync::Arc;
 
 use self::checksum::verify_checksum;
 use crate::miniscript::{Legacy, Miniscript, Segwitv0};
+use crate::plan::{AssetProvider, Assets, IntoAssets, Plan};
 use crate::prelude::*;
 use crate::{
     expression, hash256, miniscript, BareCtx, Error, ForEachKey, MiniscriptKey, Satisfier,
@@ -435,7 +436,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
             Descriptor::Wpkh(ref wpkh) => wpkh.get_satisfaction(satisfier),
             Descriptor::Wsh(ref wsh) => wsh.get_satisfaction(satisfier),
             Descriptor::Sh(ref sh) => sh.get_satisfaction(satisfier),
-            Descriptor::Tr(ref tr) => tr.get_satisfaction(satisfier),
+            Descriptor::Tr(ref tr) => tr.get_satisfaction(&satisfier),
         }
     }
 
@@ -452,7 +453,7 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
             Descriptor::Wpkh(ref wpkh) => wpkh.get_satisfaction_mall(satisfier),
             Descriptor::Wsh(ref wsh) => wsh.get_satisfaction_mall(satisfier),
             Descriptor::Sh(ref sh) => sh.get_satisfaction_mall(satisfier),
-            Descriptor::Tr(ref tr) => tr.get_satisfaction_mall(satisfier),
+            Descriptor::Tr(ref tr) => tr.get_satisfaction_mall(&satisfier),
         }
     }
 
@@ -467,6 +468,38 @@ impl<Pk: MiniscriptKey + ToPublicKey> Descriptor<Pk> {
         txin.witness = Witness::from_vec(witness);
         txin.script_sig = script_sig;
         Ok(())
+    }
+}
+
+impl Descriptor<DefiniteDescriptorKey> {
+    /// Returns a plan if the provided assets are sufficient to produce a non-malleable satisfaction
+    pub fn get_plan<P>(&self, provider: &P) -> Option<Plan>
+    where
+        P: AssetProvider<DefiniteDescriptorKey>,
+    {
+        match *self {
+            Descriptor::Bare(ref bare) => bare.get_plan(provider),
+            Descriptor::Pkh(ref pkh) => pkh.get_plan(provider),
+            Descriptor::Wpkh(ref wpkh) => wpkh.get_plan(provider),
+            Descriptor::Wsh(ref wsh) => wsh.get_plan(provider),
+            Descriptor::Sh(ref sh) => sh.get_plan(provider),
+            Descriptor::Tr(ref tr) => tr.get_plan(provider),
+        }
+    }
+
+    /// Returns a plan if the provided assets are sufficient to produce a malleable satisfaction
+    pub fn get_plan_mall<P>(&self, provider: &P) -> Option<Plan>
+    where
+        P: AssetProvider<DefiniteDescriptorKey>,
+    {
+        match *self {
+            Descriptor::Bare(ref bare) => bare.get_plan_mall(provider),
+            Descriptor::Pkh(ref pkh) => pkh.get_plan_mall(provider),
+            Descriptor::Wpkh(ref wpkh) => wpkh.get_plan_mall(provider),
+            Descriptor::Wsh(ref wsh) => wsh.get_plan_mall(provider),
+            Descriptor::Sh(ref sh) => sh.get_plan_mall(provider),
+            Descriptor::Tr(ref tr) => tr.get_plan_mall(provider),
+        }
     }
 }
 
@@ -770,6 +803,46 @@ impl Descriptor<DefiniteDescriptorKey> {
 
         let derived = self.translate_pk(&mut Derivator(secp))?;
         Ok(derived)
+    }
+
+    /// Returns the set of keys which are available in the [`KeyMap`] in form of [`Assets`]
+    pub fn available_keys(&self, key_map: &KeyMap) -> Assets {
+        let mut available_keys = vec![];
+
+        self.for_each_key(|pk| {
+            let found = match &pk.0 {
+                s @ DescriptorPublicKey::Single(_) => key_map.contains_key(&s),
+                DescriptorPublicKey::XPub(xkey) => {
+                    if key_map.contains_key(&DescriptorPublicKey::XPub(xkey.clone())) {
+                        true
+                    } else if xkey.derivation_path.len() > 0 {
+                        let unwind_wildcard = DescriptorXKey {
+                            origin: xkey.origin.clone(),
+                            xkey: xkey.xkey,
+                            wildcard: Wildcard::Unhardened,
+                            derivation_path: xkey
+                                .derivation_path
+                                .into_iter()
+                                .take(xkey.derivation_path.len() - 1)
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .into(),
+                        };
+                        key_map.contains_key(&DescriptorPublicKey::XPub(unwind_wildcard))
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            if found {
+                available_keys.push(pk.clone());
+            }
+
+            true
+        });
+
+        available_keys.into_assets()
     }
 }
 

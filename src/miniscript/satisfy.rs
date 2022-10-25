@@ -19,17 +19,22 @@
 //!
 
 use core::{cmp, i64, mem};
+use std::fmt;
 
 use bitcoin::hashes::hash160;
 use bitcoin::secp256k1::XOnlyPublicKey;
 use bitcoin::util::taproot::{ControlBlock, LeafVersion, TapLeafHash};
-use bitcoin::{LockTime, PackedLockTime, Sequence};
+use bitcoin::{LockTime, PackedLockTime, Script, Sequence};
 use sync::Arc;
 
 use super::context::SigType;
+use crate::descriptor::DescriptorType;
+use crate::plan::{AssetProvider, Plan};
 use crate::prelude::*;
 use crate::util::witness_size;
-use crate::{Miniscript, MiniscriptKey, ScriptContext, Terminal, ToPublicKey};
+use crate::{
+    DefiniteDescriptorKey, Miniscript, MiniscriptKey, ScriptContext, Terminal, ToPublicKey,
+};
 
 /// Type alias for 32 byte Preimage.
 pub type Preimage32 = [u8; 32];
@@ -500,11 +505,115 @@ impl_tuple_satisfier!(A, B, C, D, E, F);
 impl_tuple_satisfier!(A, B, C, D, E, F, G);
 impl_tuple_satisfier!(A, B, C, D, E, F, G, H);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Placeholder for some data in a [`WitnessTemplate`]
+pub enum Placeholder<Pk: MiniscriptKey> {
+    /// Public key and its size
+    Pubkey(Pk, usize),
+    /// Public key hash and its size
+    PubkeyHash(hash160::Hash, usize),
+    /// ECDSA signature given the raw pubkey
+    EcdsaSigPk(Pk),
+    /// ECDSA signature given the pubkey hash
+    EcdsaSigHash(hash160::Hash),
+    /// Schnorr signature
+    SchnorrSig(Pk, Option<TapLeafHash>),
+    /// SHA-256 preimage
+    Sha256Preimage(Pk::Sha256),
+    /// HASH256 preimage
+    Hash256Preimage(Pk::Hash256),
+    /// RIPEMD160 preimage
+    Ripemd160Preimage(Pk::Ripemd160),
+    /// HASH160 preimage
+    Hash160Preimage(Pk::Hash160),
+    /// Hash dissatisfaction (32 bytes of 0x00)
+    HashDissatisfaction,
+    /// OP_1
+    PushOne,
+    /// <empty item>
+    PushZero,
+
+    /// Taproot leaf script
+    TapScript(Script),
+    /// Taproot control block
+    TapControlBlock(ControlBlock),
+}
+
+impl<Pk: MiniscriptKey> fmt::Display for Placeholder<Pk> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        use bitcoin::hashes::hex::ToHex;
+        use Placeholder::*;
+        match self {
+            Pubkey(pk, size) => write!(f, "Pubkey(pk: {}, size: {})", pk, size),
+            PubkeyHash(pkh, size) => write!(f, "PubkeyHash(pkh: {}, size: {})", pkh, size),
+            EcdsaSigPk(pk) => write!(f, "EcdsaSigPk(pk: {})", pk),
+            EcdsaSigHash(hash) => write!(f, "EcdsaSigHash(hash: {})", hash),
+            SchnorrSig(pk, tap_leaf_hash) => write!(
+                f,
+                "SchnorrSig(pk: {}, tap_leaf_hash: {:?})",
+                pk, tap_leaf_hash
+            ),
+            Sha256Preimage(hash) => write!(f, "Sha256Preimage(hash: {})", hash),
+            Hash256Preimage(hash) => write!(f, "Hash256Preimage(hash: {})", hash),
+            Ripemd160Preimage(hash) => write!(f, "Ripemd160Preimage(hash: {})", hash),
+            Hash160Preimage(hash) => write!(f, "Hash160Preimage(hash: {})", hash),
+            HashDissatisfaction => write!(f, "HashDissatisfaction"),
+            PushOne => write!(f, "PushOne"),
+            PushZero => write!(f, "PushZero"),
+            TapScript(script) => write!(f, "TapScript(script: {})", script),
+            TapControlBlock(control_block) => write!(
+                f,
+                "TapControlBlock(control_block: {})",
+                control_block.serialize().to_hex()
+            ),
+        }
+    }
+}
+
+impl<Pk: MiniscriptKey + ToPublicKey> Placeholder<Pk> {
+    /// Replaces the placeholders with the information given by the satisfier
+    fn satisfy_self<Sat: Satisfier<Pk>>(&self, sat: &Sat) -> Option<Vec<u8>> {
+        match self {
+            Placeholder::Pubkey(pk, _) => Some(pk.to_public_key().to_bytes()),
+            // Placeholder::PubkeyHash might be created after a call to lookup_raw_pkh_pk (in
+            // pkh_public_key) or a call to lookup_raw_pkh_ecdsa_sig (in pkh_signature).
+            // For this reason, here we have to call both methods to find the key.
+            Placeholder::PubkeyHash(pkh, size) => sat
+                .lookup_raw_pkh_pk(pkh)
+                .map(|p| p.to_public_key())
+                .or(sat.lookup_raw_pkh_ecdsa_sig(pkh).map(|(p, _)| p))
+                .map(|pk| {
+                    let pk = pk.to_bytes();
+                    // We have to add a 1-byte OP_PUSH
+                    debug_assert!(1 + pk.len() == *size);
+                    pk
+                }),
+            Placeholder::Hash256Preimage(h) => sat.lookup_hash256(h).map(|p| p.to_vec()),
+            Placeholder::Sha256Preimage(h) => sat.lookup_sha256(h).map(|p| p.to_vec()),
+            Placeholder::Hash160Preimage(h) => sat.lookup_hash160(h).map(|p| p.to_vec()),
+            Placeholder::Ripemd160Preimage(h) => sat.lookup_ripemd160(h).map(|p| p.to_vec()),
+            Placeholder::EcdsaSigPk(pk) => sat.lookup_ecdsa_sig(pk).map(|s| s.to_vec()),
+            Placeholder::EcdsaSigHash(pkh) => {
+                sat.lookup_raw_pkh_ecdsa_sig(pkh).map(|(_, s)| s.to_vec())
+            }
+            Placeholder::SchnorrSig(pk, Some(leaf_hash)) => sat
+                .lookup_tap_leaf_script_sig(pk, leaf_hash)
+                .map(|s| s.to_vec()),
+            Placeholder::SchnorrSig(_, _) => sat.lookup_tap_key_spend_sig().map(|s| s.to_vec()),
+            Placeholder::HashDissatisfaction => Some(vec![0; 32]),
+            Placeholder::PushZero => Some(vec![]),
+            Placeholder::PushOne => Some(vec![1]),
+            Placeholder::TapScript(s) => Some(s.to_bytes()),
+            Placeholder::TapControlBlock(cb) => Some(cb.serialize()),
+        }
+    }
+}
+
 /// A witness, if available, for a Miniscript fragment
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum Witness {
+pub enum Witness<T> {
     /// Witness Available and the value of the witness
-    Stack(Vec<Vec<u8>>),
+    Stack(Vec<T>),
     /// Third party can possibly satisfy the fragment but we cannot
     /// Witness Unavailable
     Unavailable,
@@ -513,13 +622,128 @@ pub enum Witness {
     Impossible,
 }
 
-impl PartialOrd for Witness {
+/// Enum for partially satisfied witness templates
+pub enum PartialSatisfaction<Pk: MiniscriptKey> {
+    /// Placeholder item (not yet satisfied)
+    Placeholder(Placeholder<Pk>),
+    /// Actual data
+    Data(Vec<u8>),
+}
+
+impl<Pk: MiniscriptKey> PartialSatisfaction<Pk> {
+    /// Whether the item is a placeholder
+    pub fn is_placeholder(&self) -> bool {
+        match &self {
+            PartialSatisfaction::Placeholder(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Whether the item is data
+    pub fn is_data(&self) -> bool {
+        !self.is_placeholder()
+    }
+}
+
+/// Template of a witness being constructed interactively
+///
+/// The generic `I` type determines the available API:
+/// - `Placeholder<Pk>` indicates the witness only contains placeholders, i.e. it's just an empty
+///   template
+/// - `PartialSatisfaction<Pk>` indicates the witness contains some placeholders and some actual
+///   pieces of data
+#[derive(Debug, Clone)]
+pub struct WitnessTemplate<I> {
+    stack: Vec<I>,
+}
+
+impl<I> AsRef<[I]> for WitnessTemplate<I> {
+    fn as_ref(&self) -> &[I] {
+        &self.stack
+    }
+}
+
+impl<Pk: MiniscriptKey + ToPublicKey> WitnessTemplate<Placeholder<Pk>> {
+    /// Construct an instance from a stack of placeholders
+    pub fn from_placeholder_stack(stack: Vec<Placeholder<Pk>>) -> Self {
+        WitnessTemplate { stack }
+    }
+
+    /// Try completing the witness in one go using a [`Satisfier`]
+    pub fn try_completing<Sat: Satisfier<Pk>>(&self, stfr: &Sat) -> Option<Vec<Vec<u8>>> {
+        let stack = self
+            .stack
+            .iter()
+            .map(|placeholder| placeholder.satisfy_self(stfr))
+            .collect::<Option<_>>()?;
+
+        Some(stack)
+    }
+
+    /// Being an interactive satisfaction session
+    pub fn interactive_satisfaction(self) -> WitnessTemplate<PartialSatisfaction<Pk>> {
+        WitnessTemplate {
+            stack: self
+                .stack
+                .into_iter()
+                .map(PartialSatisfaction::Placeholder)
+                .collect(),
+        }
+    }
+}
+
+impl<Pk: MiniscriptKey + ToPublicKey> WitnessTemplate<PartialSatisfaction<Pk>> {
+    /// Apply the items needed from a satisfier
+    ///
+    /// Returns the completed witness if all the placeholders have been filled, or `Err` with itself a list of missing
+    /// items otherwise.
+    pub fn apply<Sat: Satisfier<Pk>>(
+        self,
+        stfr: &Sat,
+    ) -> Result<Vec<Vec<u8>>, (Self, Vec<Placeholder<Pk>>)> {
+        let mut unsatisfied = vec![];
+
+        let stack = self
+            .stack
+            .into_iter()
+            .map(|ps| {
+                let placeholder = match &ps {
+                    PartialSatisfaction::Placeholder(p) => p,
+                    PartialSatisfaction::Data(_) => return ps,
+                };
+
+                if let Some(data) = placeholder.satisfy_self(stfr) {
+                    return PartialSatisfaction::Data(data);
+                }
+
+                unsatisfied.push(placeholder.clone());
+                ps
+            })
+            .collect::<Vec<_>>();
+
+        if unsatisfied.is_empty() {
+            Ok(stack
+                .into_iter()
+                .map(|ps| match ps {
+                    PartialSatisfaction::Data(d) => d,
+                    PartialSatisfaction::Placeholder(_) => {
+                        unreachable!("there shouldn't be any placeholder left")
+                    }
+                })
+                .collect())
+        } else {
+            Err((WitnessTemplate { stack }, unsatisfied))
+        }
+    }
+}
+
+impl<Pk: MiniscriptKey> PartialOrd for Witness<Placeholder<Pk>> {
     fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for Witness {
+impl<Pk: MiniscriptKey> Ord for Witness<Placeholder<Pk>> {
     fn cmp(&self, other: &Self) -> cmp::Ordering {
         match (self, other) {
             (&Witness::Stack(ref v1), &Witness::Stack(ref v2)) => {
@@ -537,87 +761,110 @@ impl Ord for Witness {
     }
 }
 
-impl Witness {
+impl<Pk: MiniscriptKey + ToPublicKey> Witness<Placeholder<Pk>> {
     /// Turn a signature into (part of) a satisfaction
-    fn signature<Pk: ToPublicKey, S: Satisfier<Pk>, Ctx: ScriptContext>(
-        sat: S,
+    fn signature<S: AssetProvider<Pk>, Ctx: ScriptContext>(
+        sat: &S,
         pk: &Pk,
         leaf_hash: &TapLeafHash,
     ) -> Self {
         match Ctx::sig_type() {
-            super::context::SigType::Ecdsa => match sat.lookup_ecdsa_sig(pk) {
-                Some(sig) => Witness::Stack(vec![sig.to_vec()]),
-                // Signatures cannot be forged
-                None => Witness::Impossible,
-            },
-            super::context::SigType::Schnorr => match sat.lookup_tap_leaf_script_sig(pk, leaf_hash)
-            {
-                Some(sig) => Witness::Stack(vec![sig.to_vec()]),
-                // Signatures cannot be forged
-                None => Witness::Impossible,
-            },
+            super::context::SigType::Ecdsa => {
+                if sat.lookup_ecdsa_sig(pk) {
+                    Witness::Stack(vec![Placeholder::EcdsaSigPk(pk.clone())])
+                } else {
+                    // Signatures cannot be forged
+                    Witness::Impossible
+                }
+            }
+            super::context::SigType::Schnorr => {
+                if sat.lookup_tap_leaf_script_sig(pk, leaf_hash) {
+                    Witness::Stack(vec![Placeholder::SchnorrSig(
+                        pk.clone(),
+                        Some(leaf_hash.clone()),
+                    )])
+                } else {
+                    // Signatures cannot be forged
+                    Witness::Impossible
+                }
+            }
         }
     }
 
     /// Turn a public key related to a pkh into (part of) a satisfaction
-    fn pkh_public_key<Pk: ToPublicKey, S: Satisfier<Pk>>(sat: S, pkh: &hash160::Hash) -> Self {
-        match sat.lookup_raw_pkh_pk(pkh) {
-            Some(pk) => Witness::Stack(vec![pk.to_public_key().to_bytes()]),
+    fn pkh_public_key<S: AssetProvider<Pk>, Ctx: ScriptContext>(
+        sat: &S,
+        pkh: &hash160::Hash,
+    ) -> Self {
+        if let Some(pk_len) = sat.lookup_raw_pkh_pk::<Ctx>(pkh) {
+            Witness::Stack(vec![Placeholder::PubkeyHash(pkh.clone(), pk_len)])
+        } else {
             // public key hashes are assumed to be unavailable
             // instead of impossible since it is the same as pub-key hashes
-            None => Witness::Unavailable,
+            Witness::Unavailable
         }
     }
 
     /// Turn a key/signature pair related to a pkh into (part of) a satisfaction
-    fn pkh_signature<Pk: ToPublicKey, S: Satisfier<Pk>>(sat: S, pkh: &hash160::Hash) -> Self {
-        match sat.lookup_raw_pkh_ecdsa_sig(pkh) {
-            Some((pk, sig)) => Witness::Stack(vec![sig.to_vec(), pk.to_public_key().to_bytes()]),
-            None => Witness::Impossible,
+    fn pkh_signature<S: AssetProvider<Pk>, Ctx: ScriptContext>(
+        sat: &S,
+        pkh: &hash160::Hash,
+    ) -> Self {
+        if let Some(pk_len) = sat.lookup_raw_pkh_ecdsa_sig::<Ctx>(pkh) {
+            Witness::Stack(vec![
+                Placeholder::EcdsaSigHash(pkh.clone()),
+                Placeholder::PubkeyHash(pkh.clone(), pk_len),
+            ])
+        } else {
+            Witness::Impossible
         }
     }
 
     /// Turn a hash preimage into (part of) a satisfaction
-    fn ripemd160_preimage<Pk: ToPublicKey, S: Satisfier<Pk>>(sat: S, h: &Pk::Ripemd160) -> Self {
-        match sat.lookup_ripemd160(h) {
-            Some(pre) => Witness::Stack(vec![pre.to_vec()]),
-            // Note hash preimages are unavailable instead of impossible
-            None => Witness::Unavailable,
+    fn ripemd160_preimage<S: AssetProvider<Pk>>(sat: &S, h: &Pk::Ripemd160) -> Self {
+        if sat.lookup_ripemd160(h) {
+            Witness::Stack(vec![Placeholder::Ripemd160Preimage(h.clone())])
+        // Note hash preimages are unavailable instead of impossible
+        } else {
+            Witness::Unavailable
         }
     }
 
     /// Turn a hash preimage into (part of) a satisfaction
-    fn hash160_preimage<Pk: ToPublicKey, S: Satisfier<Pk>>(sat: S, h: &Pk::Hash160) -> Self {
-        match sat.lookup_hash160(h) {
-            Some(pre) => Witness::Stack(vec![pre.to_vec()]),
-            // Note hash preimages are unavailable instead of impossible
-            None => Witness::Unavailable,
+    fn hash160_preimage<S: AssetProvider<Pk>>(sat: &S, h: &Pk::Hash160) -> Self {
+        if sat.lookup_hash160(h) {
+            Witness::Stack(vec![Placeholder::Hash160Preimage(h.clone())])
+        // Note hash preimages are unavailable instead of impossible
+        } else {
+            Witness::Unavailable
         }
     }
 
     /// Turn a hash preimage into (part of) a satisfaction
-    fn sha256_preimage<Pk: ToPublicKey, S: Satisfier<Pk>>(sat: S, h: &Pk::Sha256) -> Self {
-        match sat.lookup_sha256(h) {
-            Some(pre) => Witness::Stack(vec![pre.to_vec()]),
-            // Note hash preimages are unavailable instead of impossible
-            None => Witness::Unavailable,
+    fn sha256_preimage<S: AssetProvider<Pk>>(sat: &S, h: &Pk::Sha256) -> Self {
+        if sat.lookup_sha256(h) {
+            Witness::Stack(vec![Placeholder::Sha256Preimage(h.clone())])
+        // Note hash preimages are unavailable instead of impossible
+        } else {
+            Witness::Unavailable
         }
     }
 
     /// Turn a hash preimage into (part of) a satisfaction
-    fn hash256_preimage<Pk: ToPublicKey, S: Satisfier<Pk>>(sat: S, h: &Pk::Hash256) -> Self {
-        match sat.lookup_hash256(h) {
-            Some(pre) => Witness::Stack(vec![pre.to_vec()]),
-            // Note hash preimages are unavailable instead of impossible
-            None => Witness::Unavailable,
+    fn hash256_preimage<S: AssetProvider<Pk>>(sat: &S, h: &Pk::Hash256) -> Self {
+        if sat.lookup_hash256(h) {
+            Witness::Stack(vec![Placeholder::Hash256Preimage(h.clone())])
+        // Note hash preimages are unavailable instead of impossible
+        } else {
+            Witness::Unavailable
         }
     }
 }
 
-impl Witness {
+impl<Pk: MiniscriptKey> Witness<Placeholder<Pk>> {
     /// Produce something like a 32-byte 0 push
     fn hash_dissatisfaction() -> Self {
-        Witness::Stack(vec![vec![0; 32]])
+        Witness::Stack(vec![Placeholder::HashDissatisfaction])
     }
 
     /// Construct a satisfaction equivalent to an empty stack
@@ -627,12 +874,12 @@ impl Witness {
 
     /// Construct a satisfaction equivalent to `OP_1`
     fn push_1() -> Self {
-        Witness::Stack(vec![vec![1]])
+        Witness::Stack(vec![Placeholder::PushOne])
     }
 
     /// Construct a satisfaction equivalent to a single empty push
     fn push_0() -> Self {
-        Witness::Stack(vec![vec![]])
+        Witness::Stack(vec![Placeholder::PushZero])
     }
 
     /// Concatenate, or otherwise combine, two satisfactions
@@ -650,9 +897,9 @@ impl Witness {
 
 /// A (dis)satisfaction of a Miniscript fragment
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct Satisfaction {
+pub struct Satisfaction<T> {
     /// The actual witness stack
-    pub stack: Witness,
+    pub stack: Witness<T>,
     /// Whether or not this (dis)satisfaction has a signature somewhere
     /// in it
     pub has_sig: bool,
@@ -664,9 +911,74 @@ pub struct Satisfaction {
     pub relative_timelock: Option<Sequence>,
 }
 
-impl Satisfaction {
+impl<T> Satisfaction<T> {
+    pub(crate) fn map_stack<U, F>(self, mapfn: F) -> Satisfaction<U>
+    where
+        F: Fn(Vec<T>) -> Vec<U>,
+    {
+        let Satisfaction {
+            stack,
+            has_sig,
+            relative_timelock,
+            absolute_timelock,
+        } = self;
+        let stack = match stack {
+            Witness::Stack(stack) => Witness::Stack(mapfn(stack)),
+            Witness::Unavailable => Witness::Unavailable,
+            Witness::Impossible => Witness::Impossible,
+        };
+        Satisfaction {
+            stack,
+            has_sig,
+            relative_timelock,
+            absolute_timelock,
+        }
+    }
+}
+
+impl<Pk: MiniscriptKey + ToPublicKey> Satisfaction<Placeholder<Pk>> {
+    pub(crate) fn build_template<P, Ctx>(
+        term: &Terminal<Pk, Ctx>,
+        provider: &P,
+        root_has_sig: bool,
+        leaf_hash: &TapLeafHash,
+    ) -> Self
+    where
+        Ctx: ScriptContext,
+        P: AssetProvider<Pk>,
+    {
+        Self::satisfy_helper(
+            term,
+            provider,
+            root_has_sig,
+            leaf_hash,
+            &mut Satisfaction::minimum,
+            &mut Satisfaction::thresh,
+        )
+    }
+
+    pub(crate) fn build_template_mall<P, Ctx>(
+        term: &Terminal<Pk, Ctx>,
+        provider: &P,
+        root_has_sig: bool,
+        leaf_hash: &TapLeafHash,
+    ) -> Self
+    where
+        Ctx: ScriptContext,
+        P: AssetProvider<Pk>,
+    {
+        Self::satisfy_helper(
+            term,
+            provider,
+            root_has_sig,
+            leaf_hash,
+            &mut Satisfaction::minimum_mall,
+            &mut Satisfaction::thresh_mall,
+        )
+    }
+
     // produce a non-malleable satisafaction for thesh frag
-    fn thresh<Pk, Ctx, Sat, F>(
+    fn thresh<Ctx, Sat, F>(
         k: usize,
         subs: &[Arc<Miniscript<Pk, Ctx>>],
         stfr: &Sat,
@@ -675,10 +987,12 @@ impl Satisfaction {
         min_fn: &mut F,
     ) -> Self
     where
-        Pk: MiniscriptKey + ToPublicKey,
         Ctx: ScriptContext,
-        Sat: Satisfier<Pk>,
-        F: FnMut(Satisfaction, Satisfaction) -> Satisfaction,
+        Sat: AssetProvider<Pk>,
+        F: FnMut(
+            Satisfaction<Placeholder<Pk>>,
+            Satisfaction<Placeholder<Pk>>,
+        ) -> Satisfaction<Placeholder<Pk>>,
     {
         let mut sats = subs
             .iter()
@@ -796,7 +1110,7 @@ impl Satisfaction {
     }
 
     // produce a possily malleable satisafaction for thesh frag
-    fn thresh_mall<Pk, Ctx, Sat, F>(
+    fn thresh_mall<Ctx, Sat, F>(
         k: usize,
         subs: &[Arc<Miniscript<Pk, Ctx>>],
         stfr: &Sat,
@@ -805,10 +1119,12 @@ impl Satisfaction {
         min_fn: &mut F,
     ) -> Self
     where
-        Pk: MiniscriptKey + ToPublicKey,
         Ctx: ScriptContext,
-        Sat: Satisfier<Pk>,
-        F: FnMut(Satisfaction, Satisfaction) -> Satisfaction,
+        Sat: AssetProvider<Pk>,
+        F: FnMut(
+            Satisfaction<Placeholder<Pk>>,
+            Satisfaction<Placeholder<Pk>>,
+        ) -> Satisfaction<Placeholder<Pk>>,
     {
         let mut sats = subs
             .iter()
@@ -953,7 +1269,7 @@ impl Satisfaction {
     }
 
     // produce a non-malleable satisfaction
-    fn satisfy_helper<Pk, Ctx, Sat, F, G>(
+    fn satisfy_helper<Ctx, Sat, F, G>(
         term: &Terminal<Pk, Ctx>,
         stfr: &Sat,
         root_has_sig: bool,
@@ -962,10 +1278,12 @@ impl Satisfaction {
         thresh_fn: &mut G,
     ) -> Self
     where
-        Pk: MiniscriptKey + ToPublicKey,
         Ctx: ScriptContext,
-        Sat: Satisfier<Pk>,
-        F: FnMut(Satisfaction, Satisfaction) -> Satisfaction,
+        Sat: AssetProvider<Pk>,
+        F: FnMut(
+            Satisfaction<Placeholder<Pk>>,
+            Satisfaction<Placeholder<Pk>>,
+        ) -> Satisfaction<Placeholder<Pk>>,
         G: FnMut(
             usize,
             &[Arc<Miniscript<Pk, Ctx>>],
@@ -973,23 +1291,23 @@ impl Satisfaction {
             bool,
             &TapLeafHash,
             &mut F,
-        ) -> Satisfaction,
+        ) -> Satisfaction<Placeholder<Pk>>,
     {
         match *term {
             Terminal::PkK(ref pk) => Satisfaction {
-                stack: Witness::signature::<_, _, Ctx>(stfr, pk, leaf_hash),
+                stack: Witness::signature::<_, Ctx>(stfr, pk, leaf_hash),
                 has_sig: true,
                 relative_timelock: None,
                 absolute_timelock: None,
             },
             Terminal::PkH(ref pk) => Satisfaction {
-                stack: Witness::pkh_signature(stfr, &pk.to_pubkeyhash(Ctx::sig_type())),
+                stack: Witness::pkh_signature::<_, Ctx>(stfr, &pk.to_pubkeyhash(Ctx::sig_type())),
                 has_sig: true,
                 relative_timelock: None,
                 absolute_timelock: None,
             },
             Terminal::RawPkH(ref pkh) => Satisfaction {
-                stack: Witness::pkh_signature(stfr, pkh),
+                stack: Witness::pkh_signature::<_, Ctx>(stfr, pkh),
                 has_sig: true,
                 relative_timelock: None,
                 absolute_timelock: None,
@@ -1244,7 +1562,7 @@ impl Satisfaction {
                 let mut sig_count = 0;
                 let mut sigs = Vec::with_capacity(k);
                 for pk in keys {
-                    match Witness::signature::<_, _, Ctx>(stfr, pk, leaf_hash) {
+                    match Witness::signature::<_, Ctx>(stfr, pk, leaf_hash) {
                         Witness::Stack(sig) => {
                             sigs.push(sig);
                             sig_count += 1;
@@ -1288,9 +1606,9 @@ impl Satisfaction {
             Terminal::MultiA(k, ref keys) => {
                 // Collect all available signatures
                 let mut sig_count = 0;
-                let mut sigs = vec![vec![vec![]]; keys.len()];
+                let mut sigs = vec![vec![Placeholder::PushZero]; keys.len()];
                 for (i, pk) in keys.iter().rev().enumerate() {
-                    match Witness::signature::<_, _, Ctx>(stfr, pk, leaf_hash) {
+                    match Witness::signature::<_, Ctx>(stfr, pk, leaf_hash) {
                         Witness::Stack(sig) => {
                             sigs[i] = sig;
                             sig_count += 1;
@@ -1331,7 +1649,7 @@ impl Satisfaction {
     }
 
     // Helper function to produce a dissatisfaction
-    fn dissatisfy_helper<Pk, Ctx, Sat, F, G>(
+    fn dissatisfy_helper<Ctx, Sat, F, G>(
         term: &Terminal<Pk, Ctx>,
         stfr: &Sat,
         root_has_sig: bool,
@@ -1340,10 +1658,12 @@ impl Satisfaction {
         thresh_fn: &mut G,
     ) -> Self
     where
-        Pk: MiniscriptKey + ToPublicKey,
         Ctx: ScriptContext,
-        Sat: Satisfier<Pk>,
-        F: FnMut(Satisfaction, Satisfaction) -> Satisfaction,
+        Sat: AssetProvider<Pk>,
+        F: FnMut(
+            Satisfaction<Placeholder<Pk>>,
+            Satisfaction<Placeholder<Pk>>,
+        ) -> Satisfaction<Placeholder<Pk>>,
         G: FnMut(
             usize,
             &[Arc<Miniscript<Pk, Ctx>>],
@@ -1351,7 +1671,7 @@ impl Satisfaction {
             bool,
             &TapLeafHash,
             &mut F,
-        ) -> Satisfaction,
+        ) -> Satisfaction<Placeholder<Pk>>,
     {
         match *term {
             Terminal::PkK(..) => Satisfaction {
@@ -1363,14 +1683,17 @@ impl Satisfaction {
             Terminal::PkH(ref pk) => Satisfaction {
                 stack: Witness::combine(
                     Witness::push_0(),
-                    Witness::pkh_public_key(stfr, &pk.to_pubkeyhash(Ctx::sig_type())),
+                    Witness::pkh_public_key::<_, Ctx>(stfr, &pk.to_pubkeyhash(Ctx::sig_type())),
                 ),
                 has_sig: false,
                 relative_timelock: None,
                 absolute_timelock: None,
             },
             Terminal::RawPkH(ref pkh) => Satisfaction {
-                stack: Witness::combine(Witness::push_0(), Witness::pkh_public_key(stfr, pkh)),
+                stack: Witness::combine(
+                    Witness::push_0(),
+                    Witness::pkh_public_key::<_, Ctx>(stfr, pkh),
+                ),
                 has_sig: false,
                 relative_timelock: None,
                 absolute_timelock: None,
@@ -1529,59 +1852,74 @@ impl Satisfaction {
                 absolute_timelock: None,
             },
             Terminal::Multi(k, _) => Satisfaction {
-                stack: Witness::Stack(vec![vec![]; k + 1]),
+                stack: Witness::Stack(vec![Placeholder::PushZero; k + 1]),
                 has_sig: false,
                 relative_timelock: None,
                 absolute_timelock: None,
             },
             Terminal::MultiA(_, ref pks) => Satisfaction {
-                stack: Witness::Stack(vec![vec![]; pks.len()]),
+                stack: Witness::Stack(vec![Placeholder::PushZero; pks.len()]),
                 has_sig: false,
                 relative_timelock: None,
                 absolute_timelock: None,
             },
         }
     }
+}
 
+impl Satisfaction<Placeholder<DefiniteDescriptorKey>> {
+    pub(crate) fn into_plan(self, desc_type: DescriptorType) -> Option<Plan> {
+        if let Witness::Stack(stack) = self.stack {
+            Some(Plan {
+                desc_type,
+                template: WitnessTemplate::from_placeholder_stack(stack),
+                absolute_timelock: self.absolute_timelock.map(Into::into),
+                relative_timelock: self.relative_timelock,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+impl Satisfaction<Vec<u8>> {
     /// Produce a satisfaction non-malleable satisfaction
-    pub(super) fn satisfy<
-        Pk: MiniscriptKey + ToPublicKey,
-        Ctx: ScriptContext,
-        Sat: Satisfier<Pk>,
-    >(
+    pub(super) fn satisfy<Ctx, Pk, Sat>(
         term: &Terminal<Pk, Ctx>,
         stfr: &Sat,
         root_has_sig: bool,
         leaf_hash: &TapLeafHash,
-    ) -> Self {
-        Self::satisfy_helper(
-            term,
-            stfr,
-            root_has_sig,
-            leaf_hash,
-            &mut Satisfaction::minimum,
-            &mut Satisfaction::thresh,
-        )
+    ) -> Self
+    where
+        Ctx: ScriptContext,
+        Pk: MiniscriptKey + ToPublicKey,
+        Sat: Satisfier<Pk>,
+    {
+        Satisfaction::<Placeholder<Pk>>::build_template(term, &stfr, root_has_sig, leaf_hash)
+            .map_stack(|stack| {
+                WitnessTemplate::from_placeholder_stack(stack)
+                    .try_completing(stfr)
+                    .expect("the same satisfier should manage to complete the template")
+            })
     }
 
     /// Produce a satisfaction(possibly malleable)
-    pub(super) fn satisfy_mall<
-        Pk: MiniscriptKey + ToPublicKey,
-        Ctx: ScriptContext,
-        Sat: Satisfier<Pk>,
-    >(
+    pub(super) fn satisfy_mall<Ctx, Pk, Sat>(
         term: &Terminal<Pk, Ctx>,
         stfr: &Sat,
         root_has_sig: bool,
         leaf_hash: &TapLeafHash,
-    ) -> Self {
-        Self::satisfy_helper(
-            term,
-            stfr,
-            root_has_sig,
-            leaf_hash,
-            &mut Satisfaction::minimum_mall,
-            &mut Satisfaction::thresh_mall,
-        )
+    ) -> Self
+    where
+        Ctx: ScriptContext,
+        Pk: MiniscriptKey + ToPublicKey,
+        Sat: Satisfier<Pk>,
+    {
+        Satisfaction::<Placeholder<Pk>>::build_template_mall(term, &stfr, root_has_sig, leaf_hash)
+            .map_stack(|stack| {
+                WitnessTemplate::from_placeholder_stack(stack)
+                    .try_completing(stfr)
+                    .expect("the same satisfier should manage to complete the template")
+            })
     }
 }
